@@ -37,6 +37,14 @@ func LinkPreviewWhitelist() []Site {
 			Title:   "YouTube shortener",
 			Address: "youtu.be",
 		},
+		Site{
+			Title:   "Tenor GIFs",
+			Address: "tenor.com",
+		},
+		Site{
+			Title:   "GIPHY GIFs",
+			Address: "giphy.com",
+		},
 	}
 }
 
