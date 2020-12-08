@@ -2173,6 +2173,92 @@ func (s *MessengerSuite) TestRequestHistoricMessagesRequest() {
 	s.NotEmpty(shh.req.Bloom)
 }
 
+func (s *MessengerSuite) TestSentEventTracking() {
+
+	//when message sent, its sent field should be "false" until we got confirmation
+	chat := CreatePublicChat("test-chat", s.m.transport)
+	err := s.m.SaveChat(&chat)
+	s.NoError(err)
+	inputMessage := buildTestMessage(chat)
+
+	_, err = s.m.SendChatMessage(context.Background(), inputMessage)
+	s.NoError(err)
+
+	rawMessage, err := s.m.persistence.RawMessageByID(inputMessage.ID)
+	s.NoError(err)
+	s.False(rawMessage.Sent)
+
+	//when message sent, its sent field should be true after we got confirmation
+	err = s.m.processSentMessages([]string{inputMessage.ID})
+	s.NoError(err)
+
+	rawMessage, err = s.m.persistence.RawMessageByID(inputMessage.ID)
+	s.NoError(err)
+	s.True(rawMessage.Sent)
+}
+
+func (s *MessengerSuite) TestMessageExpired() {
+	//send message
+	chat := CreatePublicChat("test-chat", s.m.transport)
+	err := s.m.SaveChat(&chat)
+	s.NoError(err)
+	inputMessage := buildTestMessage(chat)
+
+	_, err = s.m.SendChatMessage(context.Background(), inputMessage)
+	s.NoError(err)
+
+	rawMessage, err := s.m.persistence.RawMessageByID(inputMessage.ID)
+	s.NoError(err)
+	s.Equal(1, rawMessage.SendCount)
+	s.False(rawMessage.Expired)
+
+	//imitate chat message expired, check that it WASN't resent under the hood
+	err = s.m.processExpiredMessages([]string{inputMessage.ID})
+	s.NoError(err)
+
+	rawMessage, err = s.m.persistence.RawMessageByID(inputMessage.ID)
+	s.NoError(err)
+	s.Equal(1, rawMessage.SendCount)
+	s.False(rawMessage.Sent)
+	s.True(rawMessage.Expired)
+}
+
+func (s *MessengerSuite) TestResendExpiredEmojis() {
+	//send message
+	chat := CreatePublicChat("test-chat", s.m.transport)
+	err := s.m.SaveChat(&chat)
+	s.NoError(err)
+	inputMessage := buildTestMessage(chat)
+
+	_, err = s.m.SendChatMessage(context.Background(), inputMessage)
+	s.NoError(err)
+
+	//create emoji
+	_, err = s.m.SendEmojiReaction(context.Background(), chat.ID, inputMessage.ID, protobuf.EmojiReaction_SAD)
+	s.Require().NoError(err)
+
+	ids, err := s.m.persistence.RawMessagesIDsByType(protobuf.ApplicationMetadataMessage_EMOJI_REACTION)
+	s.Require().NoError(err)
+	emojiID := ids[0]
+
+	//check that emoji was sent one time
+	rawMessage, err := s.m.persistence.RawMessageByID(emojiID)
+	s.NoError(err)
+	s.False(rawMessage.Sent)
+	s.Equal(1, rawMessage.SendCount)
+	s.False(rawMessage.Expired)
+
+	//imitate reaction expired, make sure it WAS resent under the hood
+	err = s.m.processExpiredMessages([]string{emojiID})
+	s.NoError(err)
+
+	//make sure flag set correctly
+	rawMessage, err = s.m.persistence.RawMessageByID(emojiID)
+	s.NoError(err)
+	s.False(rawMessage.Expired)
+	s.Equal(2, rawMessage.SendCount)
+}
+
 type MessageHandlerSuite struct {
 	suite.Suite
 

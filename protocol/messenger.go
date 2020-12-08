@@ -88,6 +88,55 @@ type dbConfig struct {
 	dbKey  string
 }
 
+type EnvelopeEventsInterceptor struct {
+	EnvelopeEventsHandler transport.EnvelopeEventsHandler
+	Messenger             *Messenger
+}
+
+// EnvelopeSent triggered when envelope delivered at least to 1 peer.
+func (interceptor EnvelopeEventsInterceptor) EnvelopeSent(identifiers [][]byte) {
+	if interceptor.Messenger != nil {
+		var ids []string
+		for _, identifierBytes := range identifiers {
+			ids = append(ids, types.EncodeHex(identifierBytes))
+		}
+
+		err := interceptor.Messenger.processSentMessages(ids)
+		if err != nil {
+			interceptor.Messenger.logger.Info("Messenger failed to process sent messages", zap.Error(err))
+		}
+	}
+	interceptor.EnvelopeEventsHandler.EnvelopeSent(identifiers)
+}
+
+// EnvelopeExpired triggered when envelope is expired but wasn't delivered to any peer.
+func (interceptor EnvelopeEventsInterceptor) EnvelopeExpired(identifiers [][]byte, err error) {
+	if interceptor.Messenger != nil {
+		var ids []string
+		for _, identifierBytes := range identifiers {
+			ids = append(ids, types.EncodeHex(identifierBytes))
+		}
+
+		err := interceptor.Messenger.processExpiredMessages(ids)
+		if err != nil {
+			interceptor.Messenger.logger.Info("Messenger failed to process expired messages", zap.Error(err))
+		}
+	}
+	interceptor.EnvelopeEventsHandler.EnvelopeExpired(identifiers, err)
+}
+
+// MailServerRequestCompleted triggered when the mailserver sends a message to notify that the request has been completed
+func (interceptor EnvelopeEventsInterceptor) MailServerRequestCompleted(requestID types.Hash, lastEnvelopeHash types.Hash, cursor []byte, err error) {
+	//we don't track mailserver requests in Messenger, so just redirect to handler
+	interceptor.EnvelopeEventsHandler.MailServerRequestCompleted(requestID, lastEnvelopeHash, cursor, err)
+}
+
+// MailServerRequestExpired triggered when the mailserver request expires
+func (interceptor EnvelopeEventsInterceptor) MailServerRequestExpired(hash types.Hash) {
+	//we don't track mailserver requests in Messenger, so just redirect to handler
+	interceptor.EnvelopeEventsHandler.MailServerRequestExpired(hash)
+}
+
 func NewMessenger(
 	identity *ecdsa.PrivateKey,
 	node types.Node,
@@ -248,9 +297,93 @@ func NewMessenger(
 		logger: logger,
 	}
 
-	logger.Debug("messages persistence", zap.Bool("enabled", c.messagesPersistenceEnabled))
+	if c.envelopesMonitorConfig != nil {
+		interceptor := EnvelopeEventsInterceptor{c.envelopesMonitorConfig.EnvelopeEventsHandler, messenger}
+		err := messenger.transport.SetEnvelopeEventsHandler(interceptor)
+		if err != nil {
+			logger.Info("Unable to set envelopes event handler", zap.Error(err))
+		}
+	}
 
+	logger.Debug("messages persistence", zap.Bool("enabled", c.messagesPersistenceEnabled))
 	return messenger, nil
+}
+
+func (m *Messenger) processSentMessages(ids []string) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	for _, id := range ids {
+		rawMessage, err := m.persistence.RawMessageByID(id)
+		if err != nil {
+			return errors.Wrapf(err, "Can't get raw message with id %v", id)
+		}
+
+		rawMessage.Sent = true
+
+		err = m.persistence.SaveRawMessage(rawMessage)
+		if err != nil {
+			return errors.Wrapf(err, "Can't save raw message marked as sent")
+		}
+	}
+
+	return nil
+}
+
+func (m *Messenger) processExpiredMessages(ids []string) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	for _, id := range ids {
+		rawMessage, err := m.persistence.RawMessageByID(id)
+		if err != nil {
+			return errors.Wrapf(err, "Can't get raw message with id %v", id)
+		}
+
+		rawMessage.Expired = true
+
+		err = m.persistence.SaveRawMessage(rawMessage)
+		if err != nil {
+			return errors.Wrapf(err, "Can't save raw message marked as expired")
+		}
+	}
+
+	if m.online() {
+		err := m.resendExpiredEmojiReactions()
+		if err != nil {
+			return errors.Wrapf(err, "Unable to resend expired emoji reactions")
+		}
+	}
+
+	return nil
+}
+
+func (m *Messenger) resendExpiredEmojiReactions() error {
+	ids, err := m.persistence.ExpiredEmojiReactionsIDs()
+	if err != nil {
+		return errors.Wrapf(err, "Can't get expired reactions from db")
+	}
+
+	for _, id := range ids {
+		rawMessage, err := m.persistence.RawMessageByID(id)
+		if err != nil {
+			return errors.Wrapf(err, "Can't get raw message with id %v", id)
+		}
+		if rawMessage.SendCount < 3 {
+			//remove expired flag and resend
+			rawMessage.Expired = false
+			err = m.persistence.SaveRawMessage(rawMessage)
+			if err != nil {
+				return errors.Wrapf(err, "Can't save raw message marked as non-expired")
+			}
+
+			err = m.reSendRawMessage(context.Background(), rawMessage.ID)
+			if err != nil {
+				return errors.Wrapf(err, "Can't resend expired message with id %v", rawMessage.ID)
+			}
+		}
+	}
+	return nil
 }
 
 func (m *Messenger) Start() error {
@@ -296,6 +429,10 @@ func (m *Messenger) handleConnectionChange(online bool) {
 	if online {
 		if m.pushNotificationClient != nil {
 			m.pushNotificationClient.Online()
+		}
+		err := m.resendExpiredEmojiReactions()
+		if err != nil {
+			m.logger.Info("Unable to resend expired emoji reactions", zap.Error(err))
 		}
 
 	} else {
@@ -1545,11 +1682,8 @@ func (m *Messenger) GetContactByID(pubKey string) *Contact {
 	return m.allContacts[pubKey]
 }
 
-// ReSendChatMessage pulls a message from the database and sends it again
-func (m *Messenger) ReSendChatMessage(ctx context.Context, messageID string) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
+// pull a message from the database and send it again
+func (m *Messenger) reSendRawMessage(ctx context.Context, messageID string) error {
 	message, err := m.persistence.RawMessageByID(messageID)
 	if err != nil {
 		return err
@@ -1566,8 +1700,17 @@ func (m *Messenger) ReSendChatMessage(ctx context.Context, messageID string) err
 		MessageType:         message.MessageType,
 		Recipients:          message.Recipients,
 		ResendAutomatically: message.ResendAutomatically,
+		SendCount:           message.SendCount,
 	})
 	return err
+}
+
+// ReSendChatMessage pulls a message from the database and sends it again
+func (m *Messenger) ReSendChatMessage(ctx context.Context, messageID string) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	return m.reSendRawMessage(ctx, messageID)
 }
 
 func (m *Messenger) hasPairedDevices() bool {
@@ -3708,6 +3851,8 @@ func (m *Messenger) SendEmojiReaction(ctx context.Context, chatID, messageID str
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
+	m.logger.Info("- SendEmojiReaction")
+
 	var response MessengerResponse
 
 	chat, ok := m.allChats[chatID]
@@ -3748,7 +3893,7 @@ func (m *Messenger) SendEmojiReaction(ctx context.Context, chatID, messageID str
 
 	err = m.persistence.SaveEmojiReaction(emojiR)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "Can't save emoji reaction in db")
 	}
 
 	return &response, nil

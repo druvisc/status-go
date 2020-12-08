@@ -11,6 +11,7 @@ import (
 
 	"github.com/status-im/status-go/eth-node/crypto"
 	"github.com/status-im/status-go/protocol/common"
+	"github.com/status-im/status-go/protocol/protobuf"
 )
 
 var (
@@ -478,10 +479,11 @@ func (db sqlitePersistence) SaveRawMessage(message *common.RawMessage) error {
 		   resend_automatically,
 		   recipients,
 		   skip_encryption,
-		   send_push_notification,
+			 send_push_notification,
+			 expired,
 		   payload
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		message.ID,
 		message.LocalChatID,
 		message.LastSent,
@@ -492,6 +494,7 @@ func (db sqlitePersistence) SaveRawMessage(message *common.RawMessage) error {
 		encodedRecipients.Bytes(),
 		message.SkipEncryption,
 		message.SendPushNotification,
+		message.Expired,
 		message.Payload)
 	return err
 }
@@ -512,7 +515,8 @@ func (db sqlitePersistence) RawMessageByID(id string) (*common.RawMessage, error
 			  resend_automatically,
 			  recipients,
 			  skip_encryption,
-			  send_push_notification,
+				send_push_notification,
+				expired,
 			  payload
 			FROM
 				raw_messages
@@ -530,6 +534,7 @@ func (db sqlitePersistence) RawMessageByID(id string) (*common.RawMessage, error
 		&encodedRecipients,
 		&message.SkipEncryption,
 		&message.SendPushNotification,
+		&message.Expired,
 		&message.Payload,
 	)
 	if err != nil {
@@ -551,6 +556,60 @@ func (db sqlitePersistence) RawMessageByID(id string) (*common.RawMessage, error
 	}
 
 	return message, nil
+}
+
+func (db sqlitePersistence) RawMessagesIDsByType(t protobuf.ApplicationMetadataMessage_Type) ([]string, error) {
+	ids := []string{}
+
+	rows, err := db.db.Query(`
+			SELECT
+			  id
+			FROM
+				raw_messages
+			WHERE
+			message_type = ?`,
+		t)
+	if err != nil {
+		return ids, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+
+	return ids, nil
+}
+
+func (db sqlitePersistence) ExpiredEmojiReactionsIDs() ([]string, error) {
+	ids := []string{}
+
+	rows, err := db.db.Query(`
+			SELECT
+			  id
+			FROM
+				raw_messages
+			WHERE
+			message_type = ? AND expired = ?`,
+		protobuf.ApplicationMetadataMessage_EMOJI_REACTION, true)
+	if err != nil {
+		return ids, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+
+	return ids, nil
 }
 
 func (db sqlitePersistence) SaveContact(contact *Contact, tx *sql.Tx) (err error) {

@@ -17,6 +17,7 @@ type RawMessage struct {
 	ResendAutomatically  bool
 	SkipEncryption       bool
 	SendPushNotification bool
+	Expired              bool
 	MessageType          protobuf.ApplicationMetadataMessage_Type
 	Payload              []byte
 	Sender               *ecdsa.PrivateKey
